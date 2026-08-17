@@ -1,15 +1,14 @@
-name: Release
+name: Version Check
 on:
   pull_request:
-    types: [closed]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     branches: [main]
 
 jobs:
-  release:
-    if: github.event.pull_request.merged == true
+  version-check:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,3 +17,5 @@ jobs:
       - uses: dnogu/semantic-release-action@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          execution-mode: validate
+          package-json-mode: verify

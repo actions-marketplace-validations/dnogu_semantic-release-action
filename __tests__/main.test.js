@@ -29,12 +29,14 @@ jest.mock('fs', () => ({
 
 jest.mock('../src/utils', () => ({
   detectTriggerMode: jest.fn(),
+  detectExecutionMode: jest.fn(),
   parseLabels: jest.fn()
 }));
 
 jest.mock('../src/version', () => ({
   calculateVersion: jest.fn(),
-  updatePackageJson: jest.fn()
+  updatePackageJson: jest.fn(),
+  verifyPackageJsonVersion: jest.fn()
 }));
 
 jest.mock('../src/release', () => ({
@@ -66,10 +68,12 @@ function setupCoreInputs(overrides = {}, booleanOverrides = {}) {
     'install-command': 'npm ci',
     'test-command': 'npm test',
     'build-command': 'npm run build',
+    'package-json-mode': 'update',
     'package-json-path': 'package.json',
     'git-user-name': 'github-actions[bot]',
     'git-user-email': 'github-actions[bot]@users.noreply.github.com',
     'trigger-mode': 'auto-detect',
+    'execution-mode': 'auto-detect',
     ...overrides
   };
 
@@ -79,11 +83,12 @@ function setupCoreInputs(overrides = {}, booleanOverrides = {}) {
     'copy-assets': true,
     'auto-generate-notes': true,
     'update-package-json': true,
+    'commit-changes': true,
     ...booleanOverrides
   };
 
-  core.getInput.mockImplementation((name) => (name in stringInputs ? stringInputs[name] : ''));
-  core.getBooleanInput.mockImplementation((name) => !!booleanInputs[name]);
+  core.getInput.mockImplementation(name => (name in stringInputs ? stringInputs[name] : ''));
+  core.getBooleanInput.mockImplementation(name => !!booleanInputs[name]);
 }
 
 function setupFs({
@@ -92,7 +97,7 @@ function setupFs({
   actionYaml = false,
   packageJsonContent = JSON.stringify({ scripts: { test: 'jest', build: 'ncc build src/main.js -o dist' } })
 } = {}) {
-  fs.existsSync.mockImplementation((filePath) => {
+  fs.existsSync.mockImplementation(filePath => {
     if (filePath === 'package.json') return packageJson;
     if (filePath === 'action.yml') return actionYml;
     if (filePath === 'action.yaml') return actionYaml;
@@ -105,9 +110,10 @@ function setupFs({
 function setupExecSync({
   latestTags = 'v1.2.3\nv1',
   commits = '- feat: add feature (abc123)',
-  throwOnFetch = false
+  throwOnFetch = false,
+  stagedChanges = false
 } = {}) {
-  execSync.mockImplementation((command) => {
+  execSync.mockImplementation(command => {
     if (command === 'git fetch --tags' && throwOnFetch) {
       throw new Error('fetch failed');
     }
@@ -116,6 +122,9 @@ function setupExecSync({
     }
     if (command.startsWith('git log --pretty=format:"- %s (%h)"')) {
       return commits;
+    }
+    if (command === 'git diff --cached --quiet' && stagedChanges) {
+      throw new Error('staged changes present');
     }
     if (command === 'git status --porcelain') {
       return '';
@@ -128,9 +137,13 @@ describe('main.run', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     github.getOctokit.mockReturnValue({ rest: {} });
+    github.context.payload = { pull_request: { merged: true, labels: [] } };
+    github.context.ref = 'refs/heads/main';
+    github.context.repo = { owner: 'octocat', repo: 'demo-repo' };
     setupCoreInputs();
     setupFs();
     setupExecSync();
+    utils.detectExecutionMode.mockReturnValue('release');
   });
 
   test('skips release when no release labels are resolved', async () => {
@@ -197,6 +210,196 @@ describe('main.run', () => {
     );
 
     chdirSpy.mockRestore();
+  });
+
+  test('validates planned version for open PRs without creating a release', async () => {
+    setupCoreInputs({ 'package-json-mode': 'verify' });
+
+    utils.detectTriggerMode.mockReturnValue('pr-open');
+    utils.detectExecutionMode.mockReturnValue('validate');
+    utils.parseLabels.mockReturnValue({ releaseType: 'minor', isPrerelease: false });
+    version.calculateVersion.mockReturnValue('v1.3.0');
+
+    await run();
+
+    expect(version.verifyPackageJsonVersion).toHaveBeenCalledWith('package.json', 'v1.3.0');
+    expect(version.updatePackageJson).not.toHaveBeenCalled();
+    expect(release.createRelease).not.toHaveBeenCalled();
+    expect(execSync).not.toHaveBeenCalledWith('npm ci', { stdio: 'inherit' });
+    expect(core.setOutput).toHaveBeenCalledWith('released', 'false');
+    expect(core.setOutput).toHaveBeenCalledWith('version', 'v1.3.0');
+  });
+
+  test('prepares an open PR by updating package.json, running checks, and pushing the PR branch', async () => {
+    setupCoreInputs({
+      'package-json-mode': 'update',
+      'execution-mode': 'prepare'
+    });
+    setupFs({ packageJson: true, actionYml: true });
+    setupExecSync({ stagedChanges: true });
+
+    github.context.payload.pull_request = {
+      merged: false,
+      labels: [{ name: 'minor' }],
+      head: {
+        ref: 'feature/release-prep',
+        repo: { full_name: 'octocat/demo-repo' }
+      }
+    };
+
+    utils.detectTriggerMode.mockReturnValue('pr-open');
+    utils.detectExecutionMode.mockReturnValue('prepare');
+    utils.parseLabels.mockReturnValue({ releaseType: 'minor', isPrerelease: false });
+    version.calculateVersion.mockReturnValue('v1.3.0');
+
+    await run();
+
+    expect(version.updatePackageJson).toHaveBeenCalledWith('package.json', 'v1.3.0');
+    expect(version.verifyPackageJsonVersion).not.toHaveBeenCalled();
+    expect(execSync).toHaveBeenCalledWith('npm ci', { stdio: 'inherit' });
+    expect(execSync).toHaveBeenCalledWith('npm test', { stdio: 'inherit' });
+    expect(execSync).toHaveBeenCalledWith('npm run build', { stdio: 'inherit' });
+    expect(execSync).toHaveBeenCalledWith(
+      'git commit -m "build: update dist and version for v1.3.0"',
+      { stdio: 'inherit' }
+    );
+    expect(execSync).toHaveBeenCalledWith('git fetch origin "feature/release-prep"');
+    expect(execSync).toHaveBeenCalledWith('git rebase "origin/feature/release-prep"');
+    expect(execSync).toHaveBeenCalledWith('git push origin HEAD:feature/release-prep');
+    expect(release.createRelease).not.toHaveBeenCalled();
+    expect(core.setOutput).toHaveBeenCalledWith('released', 'false');
+    expect(core.setOutput).toHaveBeenCalledWith('version', 'v1.3.0');
+  });
+
+  test('retries prepare push once when the PR branch moves during the run', async () => {
+    setupCoreInputs({
+      'package-json-mode': 'update',
+      'execution-mode': 'prepare'
+    });
+    setupFs({ packageJson: true, actionYml: true });
+    setupExecSync({ stagedChanges: true });
+
+    github.context.payload.pull_request = {
+      merged: false,
+      labels: [{ name: 'minor' }],
+      head: {
+        ref: 'feature/release-prep',
+        repo: { full_name: 'octocat/demo-repo' }
+      }
+    };
+
+    utils.detectTriggerMode.mockReturnValue('pr-open');
+    utils.detectExecutionMode.mockReturnValue('prepare');
+    utils.parseLabels.mockReturnValue({ releaseType: 'minor', isPrerelease: false });
+    version.calculateVersion.mockReturnValue('v1.3.0');
+
+    const baseExecSync = execSync.getMockImplementation();
+    let pushAttempts = 0;
+    execSync.mockImplementation(command => {
+      if (command === 'git push origin HEAD:feature/release-prep') {
+        pushAttempts += 1;
+        if (pushAttempts === 1) {
+          throw new Error('Updates were rejected because a pushed branch tip is behind its remote counterpart');
+        }
+      }
+
+      return baseExecSync(command);
+    });
+
+    await run();
+
+    expect(core.warning).toHaveBeenCalledWith(
+      'Remote PR branch moved while prepare mode was running. Retrying push for feature/release-prep.'
+    );
+    expect(
+      execSync.mock.calls.filter(([command]) => command === 'git fetch origin "feature/release-prep"')
+    ).toHaveLength(2);
+    expect(
+      execSync.mock.calls.filter(([command]) => command === 'git rebase "origin/feature/release-prep"')
+    ).toHaveLength(2);
+    expect(
+      execSync.mock.calls.filter(([command]) => command === 'git push origin HEAD:feature/release-prep')
+    ).toHaveLength(2);
+  });
+
+  test('can verify package.json and create a tag without pushing the branch', async () => {
+    setupCoreInputs(
+      { 'package-json-mode': 'verify' },
+      { 'commit-changes': false }
+    );
+    setupFs({ packageJson: true, actionYml: true });
+
+    utils.detectTriggerMode.mockReturnValue('pr-merge');
+    utils.detectExecutionMode.mockReturnValue('release');
+    utils.parseLabels.mockReturnValue({ releaseType: 'patch', isPrerelease: false });
+    version.calculateVersion.mockReturnValue('v1.2.4');
+    release.createRelease.mockResolvedValue({
+      id: 102,
+      html_url: 'https://example.com/releases/v1.2.4'
+    });
+    release.createMajorRelease.mockResolvedValue(null);
+
+    await run();
+
+    expect(version.verifyPackageJsonVersion).toHaveBeenCalledWith('package.json', 'v1.2.4');
+    expect(version.updatePackageJson).not.toHaveBeenCalled();
+    expect(execSync).not.toHaveBeenCalledWith('git push origin HEAD');
+    expect(execSync).toHaveBeenCalledWith('git push origin "v1.2.4"');
+  });
+
+  test('release-only creates the tag and GitHub release without package.json handling or local checks', async () => {
+    setupCoreInputs(
+      {
+        'package-json-mode': 'verify',
+        'execution-mode': 'release-only'
+      },
+      { 'commit-changes': true }
+    );
+    setupFs({ packageJson: true, actionYml: true });
+
+    utils.detectTriggerMode.mockReturnValue('pr-merge');
+    utils.detectExecutionMode.mockReturnValue('release-only');
+    utils.parseLabels.mockReturnValue({ releaseType: 'patch', isPrerelease: false });
+    version.calculateVersion.mockReturnValue('v1.2.4');
+    release.createRelease.mockResolvedValue({
+      id: 103,
+      html_url: 'https://example.com/releases/v1.2.4'
+    });
+    release.createMajorRelease.mockResolvedValue({ tag: 'v1', version: 'v1.2.4' });
+
+    await run();
+
+    expect(version.verifyPackageJsonVersion).not.toHaveBeenCalled();
+    expect(version.updatePackageJson).not.toHaveBeenCalled();
+    expect(execSync).not.toHaveBeenCalledWith('npm ci', { stdio: 'inherit' });
+    expect(execSync).not.toHaveBeenCalledWith('npm test', { stdio: 'inherit' });
+    expect(execSync).not.toHaveBeenCalledWith('npm run build', { stdio: 'inherit' });
+    expect(execSync).toHaveBeenCalledWith(
+      'git config --local user.email "github-actions[bot]@users.noreply.github.com"'
+    );
+    expect(execSync).toHaveBeenCalledWith(
+      'git config --local user.name "github-actions[bot]"'
+    );
+    expect(execSync).toHaveBeenCalledWith('git push origin "v1.2.4"');
+    expect(execSync.mock.calls.filter(([command]) => command.startsWith('git commit '))).toHaveLength(0);
+    expect(execSync.mock.calls.filter(([command]) => command === 'git push origin HEAD')).toHaveLength(0);
+    expect(release.createRelease).toHaveBeenCalledWith(
+      { rest: {} },
+      github.context,
+      expect.objectContaining({
+        tagName: 'v1.2.4',
+        prerelease: false
+      })
+    );
+    expect(release.createMajorRelease).toHaveBeenCalledWith(
+      { rest: {} },
+      github.context,
+      expect.objectContaining({
+        majorVersion: 'v1',
+        fullVersion: 'v1.2.4'
+      })
+    );
+    expect(core.setOutput).toHaveBeenCalledWith('released', 'true');
   });
 
   test('does not create major release for prereleases', async () => {

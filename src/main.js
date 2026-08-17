@@ -2,15 +2,13 @@ const core = require('@actions/core');
 const github = require('@actions/github');
 const { execSync } = require('child_process');
 const fs = require('fs');
-const path = require('path');
 
-const { detectTriggerMode, parseLabels } = require('./utils');
-const { calculateVersion, updatePackageJson } = require('./version');
+const { detectTriggerMode, detectExecutionMode, parseLabels } = require('./utils');
+const { calculateVersion, updatePackageJson, verifyPackageJsonVersion } = require('./version');
 const { createRelease, createMajorRelease } = require('./release');
 
 async function run() {
   try {
-    // Get inputs
     const inputs = {
       githubToken: core.getInput('github-token', { required: true }),
       majorLabel: core.getInput('major-label'),
@@ -30,31 +28,33 @@ async function run() {
       copyAssets: core.getBooleanInput('copy-assets'),
       autoGenerateNotes: core.getBooleanInput('auto-generate-notes'),
       updatePackageJson: core.getBooleanInput('update-package-json'),
+      packageJsonMode: core.getInput('package-json-mode'),
       packageJsonPath: core.getInput('package-json-path'),
       gitUserName: core.getInput('git-user-name'),
       gitUserEmail: core.getInput('git-user-email'),
-      triggerMode: core.getInput('trigger-mode')
+      triggerMode: core.getInput('trigger-mode'),
+      executionMode: core.getInput('execution-mode'),
+      commitChanges: core.getBooleanInput('commit-changes')
     };
 
-    // Initialize GitHub client
     const octokit = github.getOctokit(inputs.githubToken);
     const context = github.context;
 
     core.info('🚀 Starting Semantic Release Action...');
-    
-    // Change to working directory if specified
+
     if (inputs.workingDirectory !== '.') {
       process.chdir(inputs.workingDirectory);
       core.info(`📁 Changed working directory to: ${inputs.workingDirectory}`);
     }
 
-    // Detect trigger mode
     const triggerMode = detectTriggerMode(inputs.triggerMode, context);
     core.info(`🔍 Detected trigger mode: ${triggerMode}`);
 
-    // Parse labels to determine release type
+    const executionMode = detectExecutionMode(inputs.executionMode, triggerMode, context);
+    core.info(`🧭 Execution mode: ${executionMode}`);
+
     const { releaseType, isPrerelease } = parseLabels(context, inputs, triggerMode);
-    
+
     if (releaseType === 'none') {
       core.info('ℹ️ No release labels found. Skipping release creation.');
       core.setOutput('released', 'false');
@@ -64,108 +64,190 @@ async function run() {
 
     core.info(`📦 Release type: ${releaseType}${isPrerelease ? ' (prerelease)' : ''}`);
 
-    // Get latest version
     const latestVersion = getLatestVersion();
     core.info(`🏷️ Latest version: ${latestVersion}`);
 
-    // Calculate new version
     const newVersion = calculateVersion(latestVersion, releaseType, isPrerelease, inputs);
     core.info(`🆕 New version: ${newVersion}`);
 
-    // Update package.json if requested
-    if (inputs.updatePackageJson) {
-      updatePackageJson(inputs.packageJsonPath, newVersion);
+    if (executionMode !== 'release-only') {
+      handlePackageJson(inputs, newVersion);
     }
 
-    // Setup Node.js and install dependencies
-    await setupNodeAndDependencies(inputs);
-
-    // Run tests
-    await runTests(inputs);
-
-    // Build project
-    await runBuild(inputs);
-
-    // Configure git
-    configureGit(inputs);
-
-    // Commit changes if any
-    await commitChanges(newVersion, inputs);
-
-    // Create and push tag
-    await createAndPushTag(newVersion);
-
-    // Generate release notes
-    const releaseNotes = generateReleaseNotes(latestVersion, newVersion, inputs);
-
-    // Create GitHub release
-    const release = await createRelease(octokit, context, {
-      tagName: newVersion,
-      name: newVersion,
-      body: releaseNotes,
-      prerelease: isPrerelease
+    setReleaseOutputs({
+      released: false,
+      version: newVersion,
+      previousVersion: latestVersion,
+      releaseType,
+      isPrerelease,
+      tagName: newVersion
     });
 
-    core.info(`✅ Created release: ${release.html_url}`);
-
-    // Set outputs
-    core.setOutput('released', 'true');
-    core.setOutput('version', newVersion);
-    core.setOutput('previous-version', latestVersion);
-    core.setOutput('release-type', releaseType);
-    core.setOutput('is-prerelease', isPrerelease.toString());
-    core.setOutput('release-url', release.html_url);
-    core.setOutput('release-id', release.id.toString());
-    core.setOutput('tag-name', newVersion);
-
-    // Sync major version tag if requested and not a prerelease
-    if (inputs.baseRelease && !isPrerelease) {
-      const majorVersion = newVersion.split('.')[0]; // e.g., 'v1' from 'v1.2.3'
-      
-      const majorRelease = await createMajorRelease(octokit, context, {
-        majorVersion,
-        fullVersion: newVersion
-      });
-
-      if (majorRelease) {
-        core.info(`✅ Synced major version tag ${majorVersion} to ${newVersion}`);
-        core.setOutput('major-version', majorVersion);
-        core.setOutput('major-release-url', release.html_url);
-      }
+    if (executionMode === 'validate') {
+      core.info('🧪 Validation mode enabled. Skipping build, branch push, tag, and release creation.');
+      return;
     }
 
-    core.info('🎉 Semantic release completed successfully!');
+    if (executionMode === 'prepare') {
+      await preparePullRequestRelease(context, inputs, newVersion);
+      core.info('✅ Pull request release preparation completed');
+      return;
+    }
 
+    if (executionMode === 'release-only') {
+      await createReleaseOnly(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease);
+      return;
+    }
+
+    await createFinalRelease(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease);
   } catch (error) {
     core.error(`❌ Action failed: ${error.message}`);
     core.setFailed(error.message);
   }
 }
 
+function handlePackageJson(inputs, newVersion) {
+  const packageJsonMode = resolvePackageJsonMode(inputs);
+
+  switch (packageJsonMode) {
+    case 'update':
+      updatePackageJson(inputs.packageJsonPath, newVersion);
+      break;
+    case 'verify':
+      verifyPackageJsonVersion(inputs.packageJsonPath, newVersion);
+      break;
+    case 'ignore':
+      core.info('📦 Skipping package.json handling');
+      break;
+    default:
+      throw new Error(`Invalid package-json-mode: ${packageJsonMode}`);
+  }
+}
+
+function resolvePackageJsonMode(inputs) {
+  return inputs.packageJsonMode || (inputs.updatePackageJson ? 'update' : 'ignore');
+}
+
+function setReleaseOutputs({ released, version, previousVersion, releaseType, isPrerelease, tagName }) {
+  core.setOutput('released', released.toString());
+  core.setOutput('version', version);
+  core.setOutput('previous-version', previousVersion);
+  core.setOutput('release-type', releaseType);
+  core.setOutput('is-prerelease', isPrerelease.toString());
+  core.setOutput('tag-name', tagName);
+}
+
+async function preparePullRequestRelease(context, inputs, newVersion) {
+  core.info('🛠️ Prepare mode enabled. Running install, test, and build without creating a tag or release.');
+
+  await setupNodeAndDependencies(inputs);
+  await runTests(inputs);
+  await runBuild(inputs);
+
+  if (!inputs.commitChanges) {
+    core.info('📝 Skipping commit step because commit-changes is disabled');
+    return;
+  }
+
+  configureGit(inputs);
+
+  const committed = await commitChanges(newVersion, inputs);
+  if (committed) {
+    await pushBranchChanges(context);
+  } else {
+    core.info('No branch changes to push after PR preparation');
+  }
+}
+
+async function createFinalRelease(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease) {
+  await setupNodeAndDependencies(inputs);
+  await runTests(inputs);
+  await runBuild(inputs);
+
+  configureGit(inputs);
+
+  let shouldPushBranch = false;
+  if (inputs.commitChanges) {
+    shouldPushBranch = await commitChanges(newVersion, inputs);
+  } else {
+    core.info('📝 Skipping commit step because commit-changes is disabled');
+  }
+
+  await createAndPushTag(newVersion, { pushBranch: shouldPushBranch });
+
+  await publishRelease(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease);
+}
+
+async function createReleaseOnly(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease) {
+  core.info('🏷️ Release-only mode enabled. Skipping package.json handling, install, test, build, and branch commits.');
+
+  configureGit(inputs);
+
+  await createAndPushTag(newVersion, { pushBranch: false });
+  await publishRelease(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease);
+}
+
+async function publishRelease(octokit, context, inputs, latestVersion, newVersion, releaseType, isPrerelease) {
+  const releaseNotes = generateReleaseNotes(latestVersion, newVersion, inputs);
+
+  const release = await createRelease(octokit, context, {
+    tagName: newVersion,
+    name: newVersion,
+    body: releaseNotes,
+    prerelease: isPrerelease
+  });
+
+  core.info(`✅ Created release: ${release.html_url}`);
+
+  setReleaseOutputs({
+    released: true,
+    version: newVersion,
+    previousVersion: latestVersion,
+    releaseType,
+    isPrerelease,
+    tagName: newVersion
+  });
+  core.setOutput('release-url', release.html_url);
+  core.setOutput('release-id', release.id.toString());
+
+  if (inputs.baseRelease && !isPrerelease) {
+    const majorVersion = newVersion.split('.')[0];
+
+    const majorRelease = await createMajorRelease(octokit, context, {
+      majorVersion,
+      fullVersion: newVersion
+    });
+
+    if (majorRelease) {
+      core.info(`✅ Synced major version tag ${majorVersion} to ${newVersion}`);
+      core.setOutput('major-version', majorVersion);
+      core.setOutput('major-release-url', release.html_url);
+    }
+  }
+
+  core.info('🎉 Semantic release completed successfully!');
+}
+
 function getLatestVersion() {
   try {
-    // First try to get tags from remote to ensure we have the latest
     execSync('git fetch --tags', { stdio: 'pipe' });
-    
-    // Get all tags and filter for semantic version tags only (exclude major version tags like v1, v2)
+
     const allTags = execSync('git tag --sort=-version:refname', { encoding: 'utf8' }).trim();
     if (allTags) {
       const tags = allTags.split('\n');
-      // Filter for semantic version tags (v1.2.3 format, not just v1)
       const semverTags = tags.filter(tag => /^v\d+\.\d+\.\d+/.test(tag));
       if (semverTags.length > 0) {
-        return semverTags[0]; // First one is the latest due to sorting
+        return semverTags[0];
       }
     }
-    
-    // Fallback: try git describe but only for semantic version tags
+
     try {
       const latestTag = execSync('git describe --tags --abbrev=0 --match="v*.*.*"', { encoding: 'utf8' }).trim();
       return latestTag;
-    } catch (e) {
-      // If no semantic version tags found
+    } catch (error) {
+      // No semantic version tags found.
     }
-    
+
     core.info('No previous semantic version tags found, starting from v0.0.0');
     return 'v0.0.0';
   } catch (error) {
@@ -176,17 +258,15 @@ function getLatestVersion() {
 
 async function setupNodeAndDependencies(inputs) {
   core.info('📦 Setting up dependencies...');
-  
-  // Auto-detect install command if not provided
+
   let installCmd = inputs.installCommand;
   if (!installCmd) {
-    const packageManager = inputs.packageManager;
     const commands = {
       npm: 'npm ci',
       yarn: 'yarn install --frozen-lockfile',
       pnpm: 'pnpm install --frozen-lockfile'
     };
-    installCmd = commands[packageManager] || 'npm ci';
+    installCmd = commands[inputs.packageManager] || 'npm ci';
   }
 
   if (fs.existsSync('package.json')) {
@@ -199,14 +279,11 @@ async function setupNodeAndDependencies(inputs) {
 
 async function runTests(inputs) {
   let testCmd = inputs.testCommand;
-  
-  if (!testCmd) {
-    // Auto-detect test command
-    if (fs.existsSync('package.json')) {
-      const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-      if (pkg.scripts && pkg.scripts.test) {
-        testCmd = `${inputs.packageManager} test`;
-      }
+
+  if (!testCmd && fs.existsSync('package.json')) {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    if (pkg.scripts && pkg.scripts.test) {
+      testCmd = `${inputs.packageManager} test`;
     }
   }
 
@@ -220,14 +297,11 @@ async function runTests(inputs) {
 
 async function runBuild(inputs) {
   let buildCmd = inputs.buildCommand;
-  
-  if (!buildCmd) {
-    // Auto-detect build command
-    if (fs.existsSync('package.json')) {
-      const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-      if (pkg.scripts && pkg.scripts.build) {
-        buildCmd = `${inputs.packageManager} run build`;
-      }
+
+  if (!buildCmd && fs.existsSync('package.json')) {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    if (pkg.scripts && pkg.scripts.build) {
+      buildCmd = `${inputs.packageManager} run build`;
     }
   }
 
@@ -247,57 +321,125 @@ function configureGit(inputs) {
 
 async function commitChanges(newVersion, inputs) {
   try {
-    // Check if this is a GitHub Action project
     const isGitHubAction = fs.existsSync('action.yml') || fs.existsSync('action.yaml');
-    
+
     if (isGitHubAction) {
       core.info('📝 Detected GitHub Action project - ensuring dist/ is committed...');
-      
-      // Add built files that are essential for GitHub Actions
-      execSync('git add dist/ || true', { stdio: 'inherit' });
-      execSync('git add coverage/ || true', { stdio: 'inherit' });
-      execSync('git add package.json || true', { stdio: 'inherit' });
-      
-      // For GitHub Actions, always commit to ensure dist/ is included in releases
-      core.info('📝 Committing built files and version changes...');
-      execSync(`git commit -m "build: update dist and version for ${newVersion}" || true`);
-    } else {
-      // Non-GitHub Action project - use original logic
-      const status = execSync('git status --porcelain', { encoding: 'utf8' });
-      if (status.trim()) {
-        core.info('📝 Committing version changes...');
-        execSync('git add .');
-        execSync(`git commit -m "chore: bump version to ${newVersion}"`);
-      } else {
-        core.info('No changes to commit');
+
+      tryGitAdd('dist/');
+      tryGitAdd('coverage/');
+
+      if (resolvePackageJsonMode(inputs) === 'update') {
+        tryGitAdd(inputs.packageJsonPath);
       }
+
+      if (!hasStagedChanges()) {
+        core.info('No staged changes to commit');
+        return false;
+      }
+
+      core.info('📝 Committing built files and version changes...');
+      execSync(`git commit -m "build: update dist and version for ${newVersion}"`, {
+        stdio: 'inherit'
+      });
+      return true;
     }
+
+    const status = execSync('git status --porcelain', { encoding: 'utf8' });
+    if (status.trim()) {
+      core.info('📝 Committing version changes...');
+      execSync('git add .');
+      execSync(`git commit -m "chore: bump version to ${newVersion}"`, { stdio: 'inherit' });
+      return true;
+    }
+
+    core.info('No changes to commit');
+    return false;
   } catch (error) {
     core.info('No changes to commit or commit failed');
+    return false;
   }
 }
 
-async function createAndPushTag(newVersion) {
+function hasStagedChanges() {
+  try {
+    execSync('git diff --cached --quiet');
+    return false;
+  } catch (error) {
+    return true;
+  }
+}
+
+function tryGitAdd(pathspec) {
+  try {
+    execSync(`git add "${pathspec}"`, { stdio: 'inherit' });
+  } catch (error) {
+    core.info(`Skipping git add for ${pathspec}: ${error.message}`);
+  }
+}
+
+async function pushBranchChanges(context) {
+  const headRepo = context.payload.pull_request?.head?.repo?.full_name;
+  const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+  const headRef = context.payload.pull_request?.head?.ref;
+
+  if (!headRef) {
+    throw new Error('Unable to determine the pull request branch to push changes back to');
+  }
+
+  if (headRepo && headRepo !== baseRepo) {
+    throw new Error('Cannot push preparation changes to a pull request from a fork');
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      core.info(`🔄 Syncing preparation commit with latest PR branch state: ${headRef}`);
+      execSync(`git fetch origin "${headRef}"`);
+      execSync(`git rebase "origin/${headRef}"`);
+
+      core.info(`⬆️ Pushing preparation changes back to PR branch: ${headRef}`);
+      execSync(`git push origin HEAD:${headRef}`);
+      return;
+    } catch (error) {
+      const message = error.message || '';
+      const shouldRetry = /behind its remote counterpart|non-fast-forward|fetch first|failed to push/i.test(message);
+
+      if (attempt < 2 && shouldRetry) {
+        core.warning(`Remote PR branch moved while prepare mode was running. Retrying push for ${headRef}.`);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+}
+
+async function createAndPushTag(newVersion, options = {}) {
+  const { pushBranch = false } = options;
   core.info(`🏷️ Creating and pushing tag: ${newVersion}`);
-  
-  // Delete existing tag if it exists (locally and remote)
+
   try {
     execSync(`git tag -d "${newVersion}"`, { stdio: 'pipe' });
     core.info(`Deleted existing local tag: ${newVersion}`);
-  } catch (e) {
-    // Tag doesn't exist locally, that's fine
+  } catch (error) {
+    // Tag doesn't exist locally.
   }
-  
+
   try {
     execSync(`git push origin ":refs/tags/${newVersion}"`, { stdio: 'pipe' });
     core.info(`Deleted existing remote tag: ${newVersion}`);
-  } catch (e) {
-    // Tag doesn't exist remotely, that's fine
+  } catch (error) {
+    // Tag doesn't exist remotely.
   }
-  
-  // Create new tag
+
   execSync(`git tag -a "${newVersion}" -m "Release ${newVersion}"`);
-  execSync(`git push origin HEAD`);
+
+  if (pushBranch) {
+    execSync('git push origin HEAD');
+  } else {
+    core.info('Skipping branch push; only pushing the release tag');
+  }
+
   execSync(`git push origin "${newVersion}"`);
 }
 
@@ -307,20 +449,14 @@ function generateReleaseNotes(latestVersion, newVersion, inputs) {
   }
 
   core.info('📝 Generating release notes...');
-  
+
   let notes = '## What\'s Changed\n\n';
-  
+
   try {
-    let commitRange;
-    if (latestVersion === 'v0.0.0') {
-      commitRange = 'HEAD';
-    } else {
-      commitRange = `${latestVersion}..HEAD`;
-    }
-    
+    const commitRange = latestVersion === 'v0.0.0' ? 'HEAD' : `${latestVersion}..HEAD`;
     const commits = execSync(`git log --pretty=format:"- %s (%h)" ${commitRange}`, { encoding: 'utf8' });
     notes += commits;
-    
+
     if (latestVersion !== 'v0.0.0') {
       const repoUrl = `https://github.com/${github.context.repo.owner}/${github.context.repo.repo}`;
       notes += `\n\n**Full Changelog**: ${repoUrl}/compare/${latestVersion}...${newVersion}`;
@@ -329,11 +465,10 @@ function generateReleaseNotes(latestVersion, newVersion, inputs) {
     core.warning('Failed to generate detailed release notes');
     notes = `Release ${newVersion}`;
   }
-  
+
   return notes;
 }
 
-// Only run if this is the main module
 if (require.main === module) {
   run();
 }

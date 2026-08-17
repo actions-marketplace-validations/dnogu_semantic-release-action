@@ -11,6 +11,7 @@ jest.mock('@actions/github', () => ({}));
 const core = require('@actions/core');
 const {
   detectTriggerMode,
+  detectExecutionMode,
   parseLabels,
   parseVersion,
   formatVersion,
@@ -37,6 +38,14 @@ describe('utils', () => {
       expect(detectTriggerMode('auto-detect', context)).toBe('pr-merge');
     });
 
+    test('detects open PR events', () => {
+      const context = {
+        eventName: 'pull_request',
+        payload: { pull_request: { merged: false } }
+      };
+      expect(detectTriggerMode('auto-detect', context)).toBe('pr-open');
+    });
+
     test('detects manual trigger', () => {
       expect(detectTriggerMode('auto-detect', { eventName: 'workflow_dispatch' })).toBe('manual');
     });
@@ -52,6 +61,49 @@ describe('utils', () => {
 
     test('returns unknown for unsupported events', () => {
       expect(detectTriggerMode('auto-detect', { eventName: 'schedule' })).toBe('unknown');
+    });
+  });
+
+  describe('detectExecutionMode', () => {
+    test('returns explicit mode when auto-detect is not used', () => {
+      expect(detectExecutionMode('release', 'pr-open')).toBe('release');
+      expect(detectExecutionMode('release-only', 'pr-merge')).toBe('release-only');
+      expect(detectExecutionMode('prepare', 'pr-open')).toBe('prepare');
+    });
+
+    test('uses prepare mode for same-repository open PRs', () => {
+      const context = {
+        payload: {
+          pull_request: {
+            head: {
+              repo: { full_name: 'octocat/demo-repo' }
+            }
+          }
+        },
+        repo: { owner: 'octocat', repo: 'demo-repo' }
+      };
+
+      expect(detectExecutionMode('auto-detect', 'pr-open', context)).toBe('prepare');
+    });
+
+    test('uses validate mode for fork pull requests', () => {
+      const context = {
+        payload: {
+          pull_request: {
+            head: {
+              repo: { full_name: 'someone-else/demo-repo' }
+            }
+          }
+        },
+        repo: { owner: 'octocat', repo: 'demo-repo' }
+      };
+
+      expect(detectExecutionMode('auto-detect', 'pr-open', context)).toBe('validate');
+    });
+
+    test('uses release mode for merged PRs and other triggers', () => {
+      expect(detectExecutionMode('auto-detect', 'pr-merge')).toBe('release');
+      expect(detectExecutionMode('auto-detect', 'workflow-call')).toBe('release');
     });
   });
 
@@ -77,6 +129,21 @@ describe('utils', () => {
         isPrerelease: true
       });
       expect(core.info).toHaveBeenCalledWith('PR labels: patch, minor, major, prerelease');
+    });
+
+    test('parses labels for open PR preparation flows', () => {
+      const context = {
+        payload: {
+          pull_request: {
+            labels: [{ name: 'patch' }]
+          }
+        }
+      };
+
+      expect(parseLabels(context, labelInputs, 'pr-open')).toEqual({
+        releaseType: 'patch',
+        isPrerelease: false
+      });
     });
 
     test('returns none when PR has no release labels', () => {
@@ -187,24 +254,78 @@ describe('utils', () => {
 
   describe('validateInputs', () => {
     test('accepts valid input values', () => {
-      expect(() => validateInputs({ githubToken: 'token', packageManager: 'npm' })).not.toThrow();
+      expect(() =>
+        validateInputs({
+          githubToken: 'token',
+          packageManager: 'npm',
+          executionMode: 'release-only',
+          packageJsonMode: 'update'
+        })
+      ).not.toThrow();
     });
 
     test('rejects missing github token', () => {
-      expect(() => validateInputs({ githubToken: '', packageManager: 'npm' })).toThrow(
+      expect(() =>
+        validateInputs({
+          githubToken: '',
+          packageManager: 'npm',
+          executionMode: 'auto-detect',
+          packageJsonMode: 'update'
+        })
+      ).toThrow(
         'Invalid inputs: github-token is required'
       );
     });
 
     test('rejects invalid package manager', () => {
-      expect(() => validateInputs({ githubToken: 'token', packageManager: 'pip' })).toThrow(
+      expect(() =>
+        validateInputs({
+          githubToken: 'token',
+          packageManager: 'pip',
+          executionMode: 'auto-detect',
+          packageJsonMode: 'update'
+        })
+      ).toThrow(
         'Invalid inputs: package-manager must be one of: npm, yarn, pnpm'
       );
     });
 
+    test('rejects invalid execution mode', () => {
+      expect(() =>
+        validateInputs({
+          githubToken: 'token',
+          packageManager: 'npm',
+          executionMode: 'preview',
+          packageJsonMode: 'update'
+        })
+      ).toThrow(
+        'Invalid inputs: execution-mode must be one of: auto-detect, validate, prepare, release, release-only'
+      );
+    });
+
+    test('rejects invalid package.json mode', () => {
+      expect(() =>
+        validateInputs({
+          githubToken: 'token',
+          packageManager: 'npm',
+          executionMode: 'auto-detect',
+          packageJsonMode: 'sync'
+        })
+      ).toThrow(
+        'Invalid inputs: package-json-mode must be one of: update, verify, ignore'
+      );
+    });
+
     test('returns all input validation errors', () => {
-      expect(() => validateInputs({ githubToken: '', packageManager: 'pip' })).toThrow(
-        'Invalid inputs: github-token is required, package-manager must be one of: npm, yarn, pnpm'
+      expect(() =>
+        validateInputs({
+          githubToken: '',
+          packageManager: 'pip',
+          executionMode: 'preview',
+          packageJsonMode: 'sync'
+        })
+      ).toThrow(
+        'Invalid inputs: github-token is required, package-manager must be one of: npm, yarn, pnpm, execution-mode must be one of: auto-detect, validate, prepare, release, release-only, package-json-mode must be one of: update, verify, ignore'
       );
     });
   });
